@@ -8,6 +8,15 @@ const ri = (a, b) => a + Math.floor(Math.random() * (b - a + 1));
 const pick = a => a[Math.floor(Math.random() * a.length)];
 const shuffle = a => { a = a.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
 const SUBJ = Object.fromEntries(SUBJECTS.map(s => [s.id, s]));
+const SEC = {}; SUBJECTS.forEach(x => x.topics.forEach(t => SEC[x.id + "|" + t[1]] = t[0]));
+const papersOf = sid => { const p = sid && SUBJ[sid] ? [...new Set(SUBJ[sid].topics.map(t => t[0]).filter(n => /^Paper \d/.test(n)))] : []; return p.length > 1 ? p : []; };
+// a topic is "in" a paper if it's listed under it, or under a shared section (practicals, maths skills) that can come up in any paper
+const inPaper = (sid, t, paper) => { if (!paper) return true; const sec = SEC[sid + "|" + t] || ""; return sec === paper || !/^Paper \d/.test(sec); };
+function evPaper(e) {
+  if (!e.s || !papersOf(e.s).length) return "";
+  const m = ["bio", "chem", "phys"].includes(e.s) && /Combined Science/.test(e.t) ? / (\d)$/.exec(e.t) : /(?:Paper|Component) (\d)/.exec(e.t);
+  const p = m ? "Paper " + m[1] : ""; return papersOf(e.s).includes(p) ? p : "";
+}
 const pad = n => String(n).padStart(2, "0");
 const dkey = d => d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate());
 const today = () => dkey(new Date());
@@ -53,6 +62,8 @@ const ICONS = {
   video: '<rect x="3" y="5" width="18" height="14" rx="3"/><path fill="currentColor" stroke="none" d="M10 9v6l5-3z"/>',
   exam: '<path d="M9 4h6v3H9z"/><path d="M15 5h2a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2"/><path d="M9 13l2 2 4-4"/>',
   cal: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>',
+  chev: '<path d="M9 6l6 6-6 6"/>',
+  user: '<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>',
   trash: '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/>',
   pencil: '<path d="M4 20l4-1L19 8a2.1 2.1 0 0 0-3-3L5 16z"/>',
   ext: '<path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/>',
@@ -74,6 +85,7 @@ function normalise(d) {
   const b = blank();
   const out = Object.assign(b, d || {});
   out.stats = Object.assign(blank().stats, (d && d.stats) || {});
+  if (!out.exDone) { out.exDone = {}; Object.keys(out.exam || {}).forEach(k => { out.exDone[k] = out.exam[k].d || 1; }); }
   if (!out.litSplit) {  // English split into Language + Literature: move Lit topic ratings and missed questions across
     const r = out.rag && out.rag.eng;
     if (r) { const lit = {}; Object.keys(r).forEach(i => { if (+i >= 8) { lit[+i - 8] = r[i]; delete r[i]; } }); if (Object.keys(lit).length) out.rag.lit = Object.assign(out.rag.lit || {}, lit); }
@@ -104,9 +116,89 @@ async function flushRemote() {
   if (pendingWrite) { pendingWrite = false; flushRemote(); }
 }
 function setSync(on) { synced = on; const el = $("#sync"); if (el) el.innerHTML = syncHTML(); }
-const syncHTML = () => '<span class="sync-dot' + (synced ? " on" : "") + '"></span>' + (synced ? "Saved to your account" : "Saved on this device");
+const syncHTML = () => '<span class="sync-dot' + (synced ? " on" : "") + '"></span>' + (synced ? (ACC.user ? "Synced as " + esc(ACC.user) : "Saved to your account") : ACC.server ? "Not synced · sign in" : "Saved on this device");
+
+/* ---------- own-server accounts (when hosted with server.js) ---------- */
+const ACC = { server: false, signups: true, token: "", user: "" };
+try { ACC.token = localStorage.getItem("rhq-token") || ""; ACC.user = localStorage.getItem("rhq-user") || ""; } catch (e) {}
+async function apiFetch(method, path, body) {
+  const r = await fetch(path, { method, headers: { "Content-Type": "application/json", ...(ACC.token ? { Authorization: "Bearer " + ACC.token } : {}) }, body: body ? JSON.stringify(body) : undefined });
+  let j = {}; try { j = await r.json(); } catch (e) {}
+  if (r.status === 401 && ACC.token && path !== "/api/login") { signOutLocal(); }
+  return { ok: r.ok, status: r.status, j };
+}
+const serverRemote = {
+  async set(data) {
+    const r = await apiFetch("PUT", "/api/progress", { data });
+    if (r.status === 409 && r.j.data && (r.j.updated || 0) > (S.updated || 0)) { S = normalise(r.j.data); saveLocal(); render(); toast("check", "Synced", "Loaded newer progress from another device."); }
+    else if (!r.ok && r.status !== 409) throw Object.assign(new Error("sync"), { code: r.status === 401 ? "invalid_argument" : "net" });
+  }
+};
+async function pullServer(preferServer) {
+  const r = await apiFetch("GET", "/api/progress");
+  if (!r.ok) return false;
+  const d = r.j.data, upd = r.j.updated || 0;
+  if (d && (preferServer || upd > (S.updated || 0))) { S = normalise(d); saveLocal(); render(); }
+  else if (!d || (S.updated || 0) > upd) await flushRemote();
+  setSync(true); return true;
+}
+function signOutLocal() { ACC.token = ""; ACC.user = ""; remote = null; try { localStorage.removeItem("rhq-token"); localStorage.removeItem("rhq-user"); } catch (e) {} setSync(false); }
+async function authSubmit(mode, username, password) {
+  const r = await apiFetch("POST", mode === "register" ? "/api/register" : "/api/login", { username, password });
+  if (!r.ok) return r.j.error || "Couldn't reach the server.";
+  ACC.token = r.j.token; ACC.user = r.j.username; try { localStorage.setItem("rhq-token", ACC.token); localStorage.setItem("rhq-user", ACC.user); localStorage.removeItem("rhq-noauth"); } catch (e) {}
+  remote = serverRemote;
+  if (mode === "register") { S.updated = Date.now(); saveLocal(); await flushRemote(); setSync(true); }   // new account starts from this device's progress
+  else await pullServer(true);                                                                       // signing in loads your saved progress
+  closeAuth(); render(); toast("check", mode === "register" ? "Account created" : "Signed in", "Progress now syncs across your devices.");
+  return null;
+}
+let authMode = "login";
+function openAuth(mode) {
+  authMode = mode || (ACC.signups ? "login" : "login");
+  let el = $("#auth"); if (!el) { el = document.createElement("div"); el.id = "auth"; el.className = "modal-bg auth-bg"; document.body.appendChild(el); }
+  el.innerHTML = `<form class="modal auth" id="auth-form" autocomplete="on">
+    <div class="auth-mark">${svg("star")}</div>
+    <h2>${authMode === "register" ? "Create your account" : "Sign in to sync"}</h2>
+    <p class="muted">${authMode === "register" ? "Your progress on this device becomes your account. Then sign in on your phone with the same details." : "Pick up your streak, XP and progress on any device."}</p>
+    <label>Username<input id="au-user" name="username" autocomplete="username" required minlength="3" maxlength="24" value="${esc(ACC.user || "")}"></label>
+    <label>Password<input id="au-pass" name="password" type="password" autocomplete="${authMode === "register" ? "new-password" : "current-password"}" required minlength="6"></label>
+    <div class="auth-err" id="au-err" role="alert"></div>
+    <button class="btn" type="submit" style="width:100%;justify-content:center">${authMode === "register" ? "Create account" : "Sign in"}</button>
+    ${ACC.signups ? `<button class="mini-link" type="button" data-auth="${authMode === "register" ? "login" : "register"}">${authMode === "register" ? "Already have an account? Sign in" : "New here? Create an account"}</button>` : ""}
+    <button class="mini-link muted" type="button" data-auth="skip">Use on this device only</button>
+  </form>`;
+  el.hidden = false; setTimeout(() => { const u = $("#au-user"); if (u) (u.value ? $("#au-pass") : u).focus(); }, 50);
+}
+function closeAuth() { const el = $("#auth"); if (el) el.remove(); }
+document.addEventListener("submit", async e => {
+  if (e.target.id !== "auth-form") return; e.preventDefault();
+  const btn = e.target.querySelector("button[type=submit]"); btn.disabled = true; btn.textContent = "One sec…";
+  let err; try { err = await authSubmit(authMode, $("#au-user").value, $("#au-pass").value); } catch (x) { err = "Couldn't reach the server."; }
+  if (err) { $("#au-err").textContent = err; btn.disabled = false; btn.textContent = authMode === "register" ? "Create account" : "Sign in"; }
+});
+document.addEventListener("click", e => {
+  const b = e.target.closest("[data-auth]"); if (!b) return;
+  if (b.dataset.auth === "skip") { try { localStorage.setItem("rhq-noauth", "1"); } catch (x) {} closeAuth(); }
+  else openAuth(b.dataset.auth);
+});
+async function connectServer() {
+  if (!/^https?:$/.test(location.protocol)) return false;
+  try {
+    const r = await fetch("/api/health", { cache: "no-store" }); if (!r.ok) return false;
+    const j = await r.json(); if (!j || !j.ok) return false;
+    ACC.server = true; ACC.signups = j.signups !== false; setSync(false);
+  } catch (e) { return false; }
+  if (ACC.token) { remote = serverRemote; if (!(await pullServer(false))) { if (!ACC.token) openAuth("login"); } }
+  else { let skip = false; try { skip = !!localStorage.getItem("rhq-noauth"); } catch (e) {} if (!skip) openAuth(S.updated ? "register" : "login"); }
+  // when you come back to the tab, grab anything another device saved
+  addEventListener("visibilitychange", () => { if (!document.hidden && remote === serverRemote) pullServer(false); });
+  addEventListener("focus", () => { if (remote === serverRemote) pullServer(false); });
+  return true;
+}
 
 async function connect(tries = 0) {
+  if (tries === 0 && await connectServer()) return;
   const c = window.claude;
   if (!c || typeof c.use !== "function") { if (tries < 6) setTimeout(() => connect(tries + 1), 1500); return; }
   try {
@@ -293,7 +385,7 @@ let view = "home";
 let quiz = null;      // active quiz runner
 let qsetup = { sid: "all", topic: "", n: 10, mode: "mixed" };
 let fc = null;        // active flashcard runner
-let topicSid = "bio";
+let topicSid = "bio", topicPaper = "";
 const focus = { len: 25 * 60, left: 25 * 60, running: false, tick: 0, sid: "" };
 let lastAct = Date.now();
 ["pointerdown", "keydown", "wheel", "touchstart"].forEach(e => addEventListener(e, () => { lastAct = Date.now(); }, { passive: true }));
@@ -305,7 +397,7 @@ function renderRail() {
   ff.innerHTML = floatTimer();
   const rail = $("#rail");
   const L = levelOf(S.xp);
-  rail.innerHTML = `<div class="me"><div class="avatar">${esc((S.name || "J")[0].toUpperCase())}</div><div><b>${esc(S.name)}</b><span>Level ${L} · ${rankOf(L)}</span></div></div>` +
+  rail.innerHTML = `<button class="me${view === "profile" ? " active" : ""}" data-act="nav" data-v="profile" title="Your stats"><div class="avatar">${esc((S.name || "J")[0].toUpperCase())}</div><div><b>${esc(S.name)}</b><span>Level ${L} · ${rankOf(L)}</span></div>${svg("chev")}</button>` +
     NAV.map(([id, label, ic]) => `<button class="nav-btn${view === id ? " active" : ""}" data-act="nav" data-v="${id}" aria-current="${view === id ? "page" : "false"}">${svg(ic)}<span>${label}</span>${id === "focus" ? navTimer() : ""}</button>`).join("") +
     `<div class="rail-foot"><strong id="goal-foot">${goalLine()}</strong><span id="sync">${syncHTML()}</span></div>`;
 }
@@ -324,11 +416,13 @@ function topbar(title, sub) {
 }
 function updateStatus() {
   const st = $("#p-streak"); if (st) { st.className = "pill flame" + (todayDone() ? "" : " cold"); st.querySelector(".val").textContent = streak(); }
-  const xp = $("#p-xp"); if (xp) { xp.querySelector(".val").textContent = S.xp.toLocaleString("en-GB"); xp.querySelector("small").textContent = "XP · Lv " + levelOf(S.xp); }
+  const xp = $("#p-xp"); if (xp && xp.querySelector(".val").textContent !== S.xp.toLocaleString("en-GB")) { xp.classList.remove("bump"); void xp.offsetWidth; xp.classList.add("bump"); }
+  if (xp) { xp.querySelector(".val").textContent = S.xp.toLocaleString("en-GB"); xp.querySelector("small").textContent = "XP · Lv " + levelOf(S.xp); }
   const mn = $("#p-min"); if (mn) mn.querySelector(".val").textContent = fmtMin(S.sec);
   const gf = $("#goal-foot"); if (gf) gf.textContent = goalLine();
 }
 
+let animNext = true, animT = null;
 function render() {
   renderRail();
   const main = $("#main");
@@ -341,13 +435,16 @@ function render() {
   else if (view === "videos") html = videosView();
   else if (view === "exam") html = examView();
   else if (view === "calendar") html = calView();
+  else if (view === "profile") html = profileView();
   else if (view === "focus") html = focusView();
   else if (view === "trophies") html = trophiesView();
   main.innerHTML = html;
+  if (animNext) { animNext = false; main.classList.remove("enter"); void main.offsetWidth; main.classList.add("enter"); clearTimeout(animT); animT = setTimeout(() => main.classList.remove("enter"), 1300); }
   if (view === "exam") initPads();
 }
 function go(v) {
   if (v !== view) { if (v !== "quiz") quiz = quiz && !quiz.done ? quiz : null; }
+  if (v !== view) animNext = true;
   view = v;
   if (location.hash !== "#" + v) history.replaceState(null, "", "#" + v);
   render(); window.scrollTo(0, 0);
@@ -468,7 +565,7 @@ function homeView() {
     return `<div class="day"><span>${lab}</span><div class="dot${hit ? " hit" : ""}${isToday ? " today" : ""}${future ? " future" : ""}" style="--p:${pp}" title="${k}: ${rec.xp} XP">${pp ? '<span class="fill"></span>' : ""}${hit ? svg("flame") : ""}</div></div>`;
   }).join("");
 
-  const mocks = upcoming().filter(e => e.k !== "info").slice(0, 2).map(e => ({ label: e.t, date: e.d, d: e.days }));
+  const mocks = upcoming().filter(e => e.k !== "info" && e.s).slice(0, 2).map(e => ({ label: e.t, date: e.d, d: e.days, e }));
 
   return topbar(`${greet}, ${esc(S.name)}`, new Date().toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long" })) + `
   ${planCard()}
@@ -504,7 +601,7 @@ function homeView() {
   </section>
 
   ${mocks.length || missed ? `<section class="grid" style="margin-top:16px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))">
-    ${mocks.map(m => `<div class="mock"><div class="days num">${m.d}<small>days</small></div><div><b>${esc(m.label)}</b><div class="muted" style="font-size:13px">${new Date(m.date).toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" })}</div></div></div>`).join("")}
+    ${mocks.map(m => `<div class="mock"><div class="days num">${m.d}<small>days</small></div><div><b>${esc(m.label)}</b><div class="muted" style="font-size:13px">${new Date(m.date).toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" })}${evPaper(m.e) ? " · revise " + evPaper(m.e) + " topics" : ""}</div></div>${revBtns(m.e)}</div>`).join("")}
     ${missed ? `<div class="mock"><div class="days num" style="color:var(--bad)">${missed}<small>to fix</small></div><div style="flex:1"><b>Weak spots</b><div class="muted" style="font-size:13px">Questions you got wrong</div></div><button class="btn small ghost" data-act="mistakes">Retry</button></div>` : ""}
   </section>` : ""}
 
@@ -526,7 +623,8 @@ function subjCard(s) {
 function topicHasQs(sid, t) { return QUESTIONS.some(q => q.s === sid && q.t === t) || GEN.some(g => g.s === sid && g.t === t); }
 function quizSetup() {
   const s = qsetup;
-  const topics = s.sid === "all" ? [] : SUBJ[s.sid].topics.filter(t => topicHasQs(s.sid, t[1]));
+  const topics = s.sid === "all" ? [] : SUBJ[s.sid].topics.filter(t => topicHasQs(s.sid, t[1]) && inPaper(s.sid, t[1], s.paper));
+  const pp = papersOf(s.sid);
   const missed = Object.keys(S.missed).filter(k => s.sid === "all" || k.startsWith(s.sid + "|")).length;
   return topbar("Quizzes", "Right answers earn XP. Build a combo for bonus points.") + `
   <div class="setup">
@@ -534,6 +632,7 @@ function quizSetup() {
       <button class="chip${s.sid === "all" ? " on" : ""}" data-act="qs-sid" data-s="all"><i style="background:linear-gradient(90deg,#4f7dff,#ff7a2f)"></i>All subjects</button>
       ${SUBJECTS.map(x => `<button class="chip${s.sid === x.id ? " on" : ""}" style="--c:${x.color}" data-act="qs-sid" data-s="${x.id}"><i></i>${x.name}</button>`).join("")}
     </div></div>
+    ${pp.length ? `<div class="field"><label>Paper</label><div class="chips"><button class="chip${!s.paper ? " on" : ""}" data-act="qs-paper" data-p="">All papers</button>${pp.map(p => `<button class="chip${s.paper === p ? " on" : ""}" data-act="qs-paper" data-p="${p}">${p} only</button>`).join("")}</div></div>` : ""}
     <div class="grid mode-row">
       <button class="mode${s.mode === "mixed" ? " on" : ""}" data-act="qs-mode" data-m="mixed"><b>Mixed</b><span>Questions from every topic</span></button>
       <button class="mode${s.mode === "topic" ? " on" : ""}" data-act="qs-mode" data-m="topic"${s.sid === "all" ? " disabled style='opacity:.45'" : ""}><b>One topic</b><span>${s.sid === "all" ? "Pick a subject first" : "Drill a single topic"}</span></button>
@@ -544,8 +643,8 @@ function quizSetup() {
     <div><button class="btn" data-act="start-quiz"${s.mode === "mistakes" && !missed ? " disabled" : ""}>${svg("play")} Start quiz</button></div>
   </div>`;
 }
-function buildQuiz(sid, mode, topic, n) {
-  const inSubj = q => sid === "all" || q.s === sid;
+function buildQuiz(sid, mode, topic, n, paper) {
+  const inSubj = q => (sid === "all" || q.s === sid) && (mode === "topic" || inPaper(q.s, q.t, paper));
   let fixed, gens;
   if (mode === "mistakes") {
     fixed = QUESTIONS.filter(q => inSubj(q) && S.missed[qkey(q)]); gens = [];
@@ -560,8 +659,8 @@ function buildQuiz(sid, mode, topic, n) {
   for (let i = 0; i < nGen; i++) { const g = pick(gens); items.push({ s: g.s, t: g.t, gen: true, ...g.f() }); }
   return shuffle(items).map(q => { const order = shuffle([0, 1, 2, 3]); return { ...q, opts: order.map(i => q.o[i]), ans: order.indexOf(0) }; });
 }
-function startQuiz(sid, mode, topic, n) {
-  const qs = buildQuiz(sid, mode, topic, n);
+function startQuiz(sid, mode, topic, n, paper) {
+  const qs = buildQuiz(sid, mode, topic, n, paper);
   if (!qs.length) { toast("quiz", "No questions here yet", "Try another topic or subject."); return; }
   quiz = { qs, i: 0, picked: null, score: 0, combo: 0, best: 0, xp: 0, sid, mode, wrong: [], active: true, done: false };
   view = "quiz"; history.replaceState(null, "", "#quiz"); render(); window.scrollTo(0, 0);
@@ -646,19 +745,30 @@ function quizResult() {
 
 /* ================= FLASHCARDS ================= */
 function deckMastery(d) { const b = S.boxes[d.id] || {}; return d.cards.filter((c, i) => (b[i] || 0) >= 2).length; }
+/* which exam paper each deck / card belongs to (deck-level string, or per-card list of paper numbers) */
+const DECK_PAPER = { rj: "Paper 1", je: "Paper 1", fr: "Paper 2", poems: "Paper 2", geocs: [1, 1, 1, 1, 1, 2, 2, 2, 2, 2], physeq: [1, 1, 1, 1, 2, 2, 1, 1, 1, 1, 1, 2, 2, 2], peterms: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 1, 2] };
+const cardInPaper = (d, i, paper) => { if (!paper) return true; const c = d.cards[i]; if (c.p !== undefined) return !c.p || "Paper " + c.p === paper; const t = DECK_PAPER[d.id]; if (!t) return true; return Array.isArray(t) ? "Paper " + t[i] === paper : t === paper; };
+const deckCards = (d, paper) => d.cards.map((c, i) => i).filter(i => cardInPaper(d, i, paper));
+let fcF = { sid: "all", paper: "" };
 function decksView() {
+  const subs = SUBJECTS.filter(x => DECKS.some(d => d.s === x.id)), pp = fcF.sid === "all" ? [] : papersOf(fcF.sid);
+  if (fcF.paper && !pp.includes(fcF.paper)) fcF.paper = "";
+  const list = DECKS.filter(d => (fcF.sid === "all" || d.s === fcF.sid) && deckCards(d, fcF.paper).length);
   return topbar("Flashcards", "Got it moves a card up a level; Again brings it back sooner.") + `
-  <section class="grid decks">${DECKS.map(d => {
-    const s = SUBJ[d.s], m = deckMastery(d);
+  <div class="chips" style="margin-bottom:${pp.length ? 10 : 18}px"><button class="chip${fcF.sid === "all" ? " on" : ""}" data-act="fc-sid" data-s="all"><i style="background:linear-gradient(90deg,#4f7dff,#ff7a2f)"></i>All decks</button>${subs.map(x => `<button class="chip${fcF.sid === x.id ? " on" : ""}" style="--c:${x.color}" data-act="fc-sid" data-s="${x.id}"><i></i>${x.name}</button>`).join("")}</div>
+  ${pp.length ? `<div class="mchips pfilter" style="margin-bottom:18px"><span class="mchips-l">Paper</span><button class="mchip${!fcF.paper ? " on" : ""}" data-act="fc-paper" data-p="">All papers</button>${pp.map(p => `<button class="mchip${fcF.paper === p ? " on" : ""}" data-act="fc-paper" data-p="${p}">${p}</button>`).join("")}</div>` : ""}
+  <section class="grid decks">${list.map(d => {
+    const s = SUBJ[d.s], idx = deckCards(d, fcF.paper), b = S.boxes[d.id] || {}, m = idx.filter(i => (b[i] || 0) >= 2).length;
+    const pn = fcF.paper && idx.length < d.cards.length ? " · " + fcF.paper : "";
     return `<button class="deck" style="--c:${s.color}" data-act="open-deck" data-d="${d.id}">
-      <div class="subj-top"><div class="glyph">${svg(s.id)}</div><div><h3>${esc(d.name)}</h3><div class="board" style="font-size:12px;color:var(--muted)">${s.name}</div></div></div>
-      <div class="meta"><span>${d.cards.length} cards</span><span>${m} mastered</span></div>
-      <div class="bar"><i style="width:${m / d.cards.length * 100}%"></i></div></button>`;
+      <div class="subj-top"><div class="glyph">${svg(s.id)}</div><div><h3>${esc(d.name)}</h3><div class="board" style="font-size:12px;color:var(--muted)">${s.name}${pn}</div></div></div>
+      <div class="meta"><span>${idx.length} cards</span><span>${m} mastered</span></div>
+      <div class="bar"><i style="width:${m / idx.length * 100}%"></i></div></button>`;
   }).join("")}</section>`;
 }
 function openDeck(id) {
   const d = DECKS.find(x => x.id === id); const b = S.boxes[id] || {};
-  const order = shuffle(d.cards.map((c, i) => i)).sort((a, z) => (b[a] || 0) - (b[z] || 0)).slice(0, 15);
+  const order = shuffle(deckCards(d, fcF.paper)).sort((a, z) => (b[a] || 0) - (b[z] || 0)).slice(0, 15);
   fc = { deck: d, queue: order, flipped: false, active: true, done: false, seen: 0, got: 0 };
   render();
 }
@@ -700,9 +810,11 @@ function topicsView() {
   const s = SUBJ[topicSid], r = S.rag[s.id] || {};
   const counts = { R: 0, A: 0, G: 0 }; Object.values(r).forEach(v => counts[v]++);
   const n = s.topics.length, none = n - counts.R - counts.A - counts.G;
-  const groups = {}; s.topics.forEach((t, i) => (groups[t[0]] = groups[t[0]] || []).push([t[1], i]));
+  const tpp = papersOf(s.id); if (topicPaper && !tpp.includes(topicPaper)) topicPaper = "";
+  const groups = {}; s.topics.forEach((t, i) => { if (inPaper(s.id, t[1], topicPaper)) (groups[t[0]] = groups[t[0]] || []).push([t[1], i]); });
   return topbar("Topics", "Rate every topic Red, Amber or Green. It feeds your confidence score.") + `
   <div class="chips" style="margin-bottom:18px">${SUBJECTS.map(x => `<button class="chip${x.id === topicSid ? " on" : ""}" style="--c:${x.color}" data-act="t-sid" data-s="${x.id}"><i></i>${x.name}</button>`).join("")}</div>
+  ${tpp.length ? `<div class="mchips pfilter" style="margin:-8px 0 18px"><span class="mchips-l">Paper</span><button class="mchip${!topicPaper ? " on" : ""}" data-act="t-paper" data-p="">All papers</button>${tpp.map(p => `<button class="mchip${topicPaper === p ? " on" : ""}" data-act="t-paper" data-p="${p}">${p}</button>`).join("")}</div>` : ""}
   <div class="card" style="margin-bottom:20px"><div class="card-head"><h2>${s.name} <span class="muted" style="font-size:14px;font-family:var(--font-body);font-weight:600">· ${s.board}</span></h2><span class="big-stat num" style="font-size:26px">${confidence(s.id)}%</span></div>
     <div class="bar rag"><i style="width:${counts.G / n * 100}%;background:var(--good)"></i><i style="width:${counts.A / n * 100}%;background:var(--amber)"></i><i style="width:${counts.R / n * 100}%;background:var(--bad)"></i></div>
     <div class="rag-legend" style="margin-top:12px"><span><i style="background:var(--good)"></i>${counts.G} confident</span><span><i style="background:var(--amber)"></i>${counts.A} getting there</span><span><i style="background:var(--bad)"></i>${counts.R} need work</span><span><i style="background:#2a3454"></i>${none} not rated</span></div></div>
@@ -791,51 +903,144 @@ function videosView() {
 
 /* ================= EXAM QUESTIONS ================= */
 const mOk = q => !exq.marks || q.m === +exq.marks;
-let exq = { pad: {}, marks: "", sid: "bio", topic: "", open: null, draft: {}, reveal: {}, ticks: {} };
+let exq = { pad: {}, paper: "", marks: "", sid: "bio", topic: "", open: null, draft: {}, reveal: {}, ticks: {}, n: 5, skipDone: true, run: null, browse: false };
 const EXQ = window.EXAMQ || [];
-const exKey = q => q.s + "|" + q.t + "|" + q.q.slice(0, 60);
+const qHash = str => { let x = 5381; for (const c of str) x = (x * 33 ^ c.charCodeAt(0)) >>> 0; return x.toString(36); };
+const exKey = q => q.k || (q.k = q.s + "|" + q.t + "|" + (q.gen ? "#" + qHash(q.q) : q.q.slice(0, 60)));
 const examCount = (sid, t) => EXQ.filter(q => q.s === sid && q.t === t).length;
 function exScore(q, k) {
   const t = exq.ticks[k] || {}, n = Object.values(t).filter(Boolean).length, P = q.ms.length;
   return P >= q.m ? Math.min(n, q.m) : Math.round(n / P * q.m);
 }
+const doneNow = k => !!(S.exDone || {})[k];
+function toggleDone(k) { S.exDone = S.exDone || {}; if (S.exDone[k]) delete S.exDone[k]; else S.exDone[k] = today(); save(); }
+const qTags = q => `${q.src ? `<span class="xtag school">From your school booklet</span>` : ""}${q.calc ? `<span class="xtag">${q.calc === "y" ? "Calculator" : "Non-calculator"}</span>` : ""}`;
+const doneBox = k => `<button class="xdone${doneNow(k) ? " on" : ""}" data-act="x-done" data-k="${esc(k)}" aria-pressed="${doneNow(k)}" title="${doneNow(k) ? "Done – tap to untick" : "Tick when you've done it"}"><i>${svg("check")}</i><span>Done</span></button>`;
+function qWork(q, k) {
+  const t = exq.ticks[k] || {}, rev = exq.reveal[k];
+  return `${q.s === "maths" ? `<div class="pad" data-k="${esc(k)}"><div class="pad-bar"><b>Working out</b><span class="pad-tools"><button class="pad-t on" data-pt="pen" aria-label="Pen">${svg("pencil")}</button><button class="pad-t" data-pt="erase">Rubber</button><button class="pad-t" data-pt="clear">Clear</button></span></div><canvas class="pad-c"></canvas></div>` : ""}
+    <textarea class="exq-ans" data-draft="${esc(k)}" rows="${q.s === "maths" ? 2 : Math.min(12, 3 + q.m)}" placeholder="${q.s === "maths" ? "Final answer (or type your working here)…" : "Write your answer like it's the real exam…"}">${esc(exq.draft[k] || "")}</textarea>
+    ${rev ? `<div class="msk"><div class="ms-h"><span>Mark scheme · tick each point you made</span><button class="ms-hide" data-act="x-hide" data-k="${esc(k)}">Hide</button></div>${q.ms.map((m, i) => `<button class="ms-pt${t[i] ? " on" : ""}" data-act="x-tick" data-k="${esc(k)}" data-i="${i}" aria-pressed="${!!t[i]}"><i>${svg("check")}</i><span>${esc(m)}</span></button>`).join("")}
+      ${q.ms.length !== q.m ? `<div class="muted ms-note">${q.ms.length > q.m ? `Any ${q.m} of these ${q.ms.length} points.` : `Long answer: each point is roughly ${Math.round(q.m / q.ms.length)} marks. Be honest about quality, not just mentioning it.`}</div>` : ""}
+      <div class="ms-foot"><b class="num">${exScore(q, k)} / ${q.m}</b>${exq.run ? "" : `<button class="btn" data-act="x-save" data-k="${esc(k)}">Save mark</button>`}</div></div>`
+    : `<button class="btn ghost" data-act="x-reveal" data-k="${esc(k)}">${svg("check")} Show mark scheme</button>`}`;
+}
+function exPool() {
+  const all = EXQ.filter(q => q.s === exq.sid && inPaper(q.s, q.t, exq.paper)), inTopic = exq.topic ? all.filter(q => q.t === exq.topic) : all;
+  return { all, inTopic, pool: inTopic.filter(mOk) };
+}
 function examView() {
-  const s = SUBJ[exq.sid], all = EXQ.filter(q => q.s === exq.sid);
-  const inTopic = exq.topic ? all.filter(q => q.t === exq.topic) : all;
+  if (exq.run) return exq.run.done ? examResult() : examRunner();
+  const s = SUBJ[exq.sid], { all, inTopic, pool } = exPool();
   const mvals = [...new Set(inTopic.map(q => q.m))].sort((a, b) => a - b);
-  if (exq.marks && !mvals.includes(+exq.marks)) exq.marks = "";
-  const list = inTopic.filter(mOk);
-  const E = S.exam || {}, doneN = all.filter(q => E[exKey(q)]).length;
+  if (exq.marks && !mvals.includes(+exq.marks)) return (exq.marks = "", examView());
+  const E = S.exam || {}, doneN = all.filter(q => doneNow(exKey(q))).length;
   const marks = all.reduce((a, q) => a + q.m, 0), got = all.reduce((a, q) => a + ((E[exKey(q)] || {}).b || 0), 0);
-  const topics = s.topics.map(t => t[1]).filter(t => examCount(s.id, t));
-  return topbar("Exam questions", "Write your answer, check the mark scheme, tick what you got.") + `
-  <div class="chips" style="margin-bottom:18px">${SUBJECTS.map(x => `<button class="chip${x.id === exq.sid ? " on" : ""}" style="--c:${x.color}" data-act="x-sid" data-s="${x.id}"><i></i>${x.name}</button>`).join("")}</div>
-  <div class="card ex-head" style="--c:${s.color}">
-    <div><h2>${s.name}</h2><span class="muted">${all.length} questions · ${doneN} attempted · ${marks ? Math.round(got / marks * 100) : 0}% of marks banked</span></div>
-    <div class="ex-ctrl"><select id="x-topic" class="select" aria-label="Topic"><option value="">All topics</option>${topics.map(t => `<option${t === exq.topic ? " selected" : ""}>${esc(t)}</option>`).join("")}</select>
-    <button class="btn" data-act="x-random">${svg("quiz")} Random question</button></div>
+  const topics = s.topics.map(t => t[1]).filter(t => examCount(s.id, t) && inPaper(s.id, t, exq.paper));
+  const pp = papersOf(s.id); if (exq.paper && !pp.includes(exq.paper)) exq.paper = "";
+  const fresh = pool.filter(q => !doneNow(exKey(q))), avail = exq.skipDone ? fresh : pool;
+  const n = Math.min(exq.n, avail.length);
+  const head = topbar("Exam questions", "Pick a subject, topic and marks. You'll get a short set, one at a time.") + `
+  <div class="chips" style="margin-bottom:18px">${SUBJECTS.map(x => `<button class="chip${x.id === exq.sid ? " on" : ""}" style="--c:${x.color}" data-act="x-sid" data-s="${x.id}"><i></i>${x.name}</button>`).join("")}</div>`;
+  if (exq.browse) return head + browseList(s, pool, inTopic, mvals, topics);
+  return head + `
+  <div class="ex-setup" style="--c:${s.color}">
+    <div class="card ex-build">
+      ${pp.length ? `<div class="xs-row"><span class="xs-l">Paper</span><div class="mchips"><button class="mchip${!exq.paper ? " on" : ""}" data-act="x-paper" data-p="">All papers</button>${pp.map(p => `<button class="mchip${exq.paper === p ? " on" : ""}" data-act="x-paper" data-p="${p}">${p}</button>`).join("")}</div></div>` : ""}
+      <div class="xs-row"><span class="xs-l">Topic</span><select id="x-topic" class="select" aria-label="Topic"><option value="">Any topic</option>${topics.map(t => `<option value="${esc(t)}"${t === exq.topic ? " selected" : ""}>${esc(t)} (${EXQ.filter(q => q.s === s.id && q.t === t && !doneNow(exKey(q))).length} left)</option>`).join("")}</select></div>
+      <div class="xs-row"><span class="xs-l">Marks</span><div class="mchips">
+        <button class="mchip${!exq.marks ? " on" : ""}" data-act="x-marks" data-m="">Any <small>${inTopic.length}</small></button>
+        ${mvals.map(m => `<button class="mchip${+exq.marks === m ? " on" : ""}" data-act="x-marks" data-m="${m}">${m} mark${m === 1 ? "" : "s"} <small>${inTopic.filter(q => q.m === m).length}</small></button>`).join("")}</div></div>
+      <div class="xs-row"><span class="xs-l">Questions</span><div class="mchips">${[3, 5, 10, 15].map(v => `<button class="mchip${exq.n === v ? " on" : ""}" data-act="x-n" data-n="${v}">${v}</button>`).join("")}</div></div>
+      <label class="xs-check"><input type="checkbox" id="x-skip"${exq.skipDone ? " checked" : ""}> Skip questions I've already done <span class="muted">(${pool.length - fresh.length} of ${pool.length} done)</span></label>
+      <div class="xs-go">
+        <div><b class="num">${n}</b> question${n === 1 ? "" : "s"} <span class="muted">· ${avail.length} available</span></div>
+        <button class="btn" data-act="x-start"${n ? "" : " disabled"}>${svg("play")} Start</button>
+      </div>
+      ${!avail.length ? `<div class="muted" style="font-size:13.5px">${pool.length ? "You've done every question here. Untick “Skip questions I've done” to go again." : "Nothing matches. Try another topic or mark."}</div>` : ""}
+    </div>
+    <div class="card ex-stats">
+      <h2>${s.name}${exq.paper ? ` <span class="muted" style="font-size:15px">· ${exq.paper}</span>` : ""}</h2>
+      <div class="xs-ring">${ring(all.length ? doneN / all.length : 0, 112, 10, s.color)}<div><b class="num">${doneN}</b><span>of ${all.length} done</span></div></div>
+      <div class="xs-mini"><div><b class="num">${marks ? Math.round(got / marks * 100) : 0}%</b><span>marks banked</span></div><div><b class="num">${Object.keys(E).filter(k => k.startsWith(s.id + "|")).length}</b><span>self-marked</span></div></div>
+      <button class="mini-link" data-act="x-browse">Browse all ${all.length} and tick them off →</button>
+    </div>
+  </div>`;
+}
+function browseList(s, list, inTopic, mvals, topics) {
+  const E = S.exam || {};
+  return `<div class="card ex-head" style="--c:${s.color}">
+    <div><button class="mini-link" data-act="x-browse" style="margin:0 0 6px">← Back to practice</button><h2>${s.name}: all questions</h2><span class="muted">Tick the ones you've done</span></div>
+    <div class="ex-ctrl"><select id="x-topic" class="select" aria-label="Topic"><option value="">All topics</option>${topics.map(t => `<option${t === exq.topic ? " selected" : ""}>${esc(t)}</option>`).join("")}</select></div>
     <div class="mchips" role="group" aria-label="Filter by marks"><span class="mchips-l">Marks</span>
-      <button class="mchip${!exq.marks ? " on" : ""}" data-act="x-marks" data-m="" aria-pressed="${!exq.marks}">All <small>${inTopic.length}</small></button>
-      ${mvals.map(m => `<button class="mchip${+exq.marks === m ? " on" : ""}" data-act="x-marks" data-m="${m}" title="${m}-mark questions" aria-pressed="${+exq.marks === m}">${m} mark${m === 1 ? "" : "s"} <small>${inTopic.filter(q => q.m === m).length}</small></button>`).join("")}</div>
+      <button class="mchip${!exq.marks ? " on" : ""}" data-act="x-marks" data-m="">All <small>${inTopic.length}</small></button>
+      ${mvals.map(m => `<button class="mchip${+exq.marks === m ? " on" : ""}" data-act="x-marks" data-m="${m}">${m} mark${m === 1 ? "" : "s"} <small>${inTopic.filter(q => q.m === m).length}</small></button>`).join("")}</div>
   </div>
   <div class="ex-list">${list.map((q, n) => {
-    const k = exKey(q), rec = E[k], open = exq.open === k, rev = exq.reveal[k], t = exq.ticks[k] || {};
-    return `<div class="exq${open ? " open" : ""}" id="xq-${n}" style="--c:${s.color}">
-      <button class="exq-top" data-act="x-open" data-k="${esc(k)}" data-n="${n}" aria-expanded="${open}">
+    const k = exKey(q), rec = E[k], open = exq.open === k;
+    return `<div class="exq${open ? " open" : ""}${doneNow(k) ? " is-done" : ""}" id="xq-${n}" style="--c:${s.color}">
+      <div class="exq-row">${doneBox(k)}<button class="exq-top" data-act="x-open" data-k="${esc(k)}" data-n="${n}" aria-expanded="${open}">
         <span class="exq-m num">${q.m}<small>mark${q.m === 1 ? "" : "s"}</small></span>
-        <span class="exq-q"><small>${esc(q.t)}</small><b>${esc(q.q)}</b></span>
+        <span class="exq-q"><small>${esc(q.t)} ${qTags(q)}</small><b>${esc(q.q)}</b></span>
         ${rec ? `<span class="tag" style="--c:${rec.b >= q.m ? "var(--good)" : "var(--amber)"}">${rec.b}/${q.m}</span>` : ""}
-      </button>
-      ${open ? `<div class="exq-body">
-        ${q.s === "maths" ? `<div class="pad" data-k="${esc(k)}"><div class="pad-bar"><b>Working out</b><span class="pad-tools"><button class="pad-t on" data-pt="pen" aria-label="Pen">${svg("pencil")}</button><button class="pad-t" data-pt="erase">Rubber</button><button class="pad-t" data-pt="clear">Clear</button></span></div><canvas class="pad-c"></canvas></div>` : ""}
-        <textarea class="exq-ans" data-draft="${esc(k)}" rows="${q.s === "maths" ? 2 : Math.min(12, 3 + q.m)}" placeholder="${q.s === "maths" ? "Final answer (or type your working here)…" : "Write your answer like it's the real exam…"}">${esc(exq.draft[k] || "")}</textarea>
-        ${rev ? `<div class="msk"><div class="ms-h"><span>Mark scheme · tick each point you made</span><button class="ms-hide" data-act="x-hide" data-k="${esc(k)}">Hide</button></div>${q.ms.map((m, i) => `<button class="ms-pt${t[i] ? " on" : ""}" data-act="x-tick" data-k="${esc(k)}" data-i="${i}" aria-pressed="${!!t[i]}"><i>${svg("check")}</i><span>${esc(m)}</span></button>`).join("")}
-          ${q.ms.length !== q.m ? `<div class="muted ms-note">${q.ms.length > q.m ? `Any ${q.m} of these ${q.ms.length} points.` : `Long answer: each point is roughly ${Math.round(q.m / q.ms.length)} marks. Be honest about quality, not just mentioning it.`}</div>` : ""}
-          <div class="ms-foot"><b class="num">${exScore(q, k)} / ${q.m}</b><button class="btn" data-act="x-save" data-k="${esc(k)}">Save mark</button></div></div>`
-        : `<button class="btn ghost" data-act="x-reveal" data-k="${esc(k)}">${svg("check")} Show mark scheme</button>`}
-      </div>` : ""}
+      </button></div>
+      ${open ? `<div class="exq-body">${qWork(q, k)}</div>` : ""}
     </div>`;
   }).join("")}</div>`;
+}
+function examStart() {
+  const { pool } = exPool();
+  const fresh = pool.filter(q => !doneNow(exKey(q))), src = exq.skipDone ? fresh : pool;
+  // mix topics: shuffle, but prefer not-yet-done first when not skipping
+  const ordered = exq.skipDone ? shuffle(src) : [...shuffle(fresh), ...shuffle(pool.filter(q => doneNow(exKey(q))))];
+  const list = ordered.slice(0, exq.n); if (!list.length) return;
+  exq.reveal = {}; exq.ticks = {};
+  exq.run = { list, i: 0, res: {}, done: false, t0: Date.now() };
+  animNext = true; render(); window.scrollTo(0, 0);
+}
+function examRunner() {
+  const r = exq.run, q = r.list[r.i], k = exKey(q), s = SUBJ[q.s];
+  return `<div class="runner ex-runner" style="--c:${s.color}">
+    <div class="run-top"><button class="x-btn" data-act="x-quit" aria-label="End this set">${svg("x")}</button>
+      <div class="bar"><i style="width:${r.i / r.list.length * 100}%"></i></div>
+      <span class="muted num" style="font-weight:700;font-size:14px">${r.i + 1} / ${r.list.length}</span></div>
+    <div class="card exq-card" style="--c:${s.color}">
+      <div class="exq-head"><span class="exq-m num">${q.m}<small>mark${q.m === 1 ? "" : "s"}</small></span>
+        <div class="exq-q"><small>${esc(s.name)} · ${esc(q.t)} ${qTags(q)}</small><b>${esc(q.q)}</b></div></div>
+      <div class="exq-body">${qWork(q, k)}</div>
+      <div class="ex-foot">${doneBox(k)}<span style="flex:1"></span>
+        <button class="btn ghost" data-act="x-skipq">Skip</button>
+        <button class="btn" data-act="x-next"${exq.reveal[k] ? "" : " disabled title=\"Check the mark scheme first\""}>${r.i + 1 < r.list.length ? "Save & next" : "Save & finish"}</button></div>
+    </div>
+  </div>`;
+}
+function examNext(doSave) {
+  const r = exq.run, q = r.list[r.i], k = exKey(q);
+  if (doSave) {
+    const sc = exScore(q, k); S.exam = S.exam || {};
+    const old = S.exam[k], firstToday = !old || old.d !== today();
+    S.exam[k] = { b: Math.max(sc, old ? old.b : 0), l: sc, d: today() };
+    S.exDone = S.exDone || {}; S.exDone[k] = S.exDone[k] || today();
+    const xp = firstToday ? Math.min(25, 3 + sc) : 0; if (xp) addXP(xp);
+    r.res[k] = { sc, m: q.m, xp };
+    if (sc >= q.m && q.m >= 3) toast("exam", "Full marks!", `${sc}/${q.m}${xp ? " · +" + xp + " XP" : ""}`);
+  } else r.res[k] = { skip: true, m: q.m };
+  if (r.i + 1 < r.list.length) { r.i++; }
+  else { r.done = true; const got = Object.values(r.res).reduce((a, x) => a + (x.sc || 0), 0), tot = Object.values(r.res).reduce((a, x) => a + (x.skip ? 0 : x.m), 0); if (tot && got / tot >= .8) confetti(); }
+  save(); checkBadges(); animNext = true; render(); window.scrollTo(0, 0);
+}
+function examResult() {
+  const r = exq.run, rows = r.list.map(q => ({ q, k: exKey(q), x: r.res[exKey(q)] || { skip: true, m: q.m } }));
+  const got = rows.reduce((a, x) => a + (x.x.sc || 0), 0), tot = rows.reduce((a, x) => a + (x.x.skip ? 0 : x.x.m), 0), xp = rows.reduce((a, x) => a + (x.x.xp || 0), 0);
+  const pct = tot ? Math.round(got / tot * 100) : 0;
+  return `<div class="runner"><div class="card result">
+    <div class="muted" style="font-weight:700;letter-spacing:.12em;text-transform:uppercase;font-size:12px">Set complete</div>
+    <div class="score num">${got}<span style="font-size:.45em;color:var(--muted)"> / ${tot}</span></div>
+    <div class="verdict">${pct >= 80 ? "Exam-ready on this lot." : pct >= 50 ? "Solid. Go over the points you missed." : tot ? "Worth another go once you've revised it." : "All skipped. Try a set again?"}</div>
+    <div class="result-stats"><div><b class="num">${pct}%</b><span>Marks</span></div><div><b class="num">+${xp}</b><span>XP</span></div><div><b class="num">${fmtMin(Math.round((Date.now() - r.t0) / 1000))}</b><span>Time</span></div></div>
+    <div class="ex-res">${rows.map(({ q, k, x }) => `<div class="ex-res-row">${doneBox(k)}<span class="exq-q"><small>${esc(q.t)}</small><b>${esc(q.q)}</b></span><span class="tag" style="--c:${x.skip ? "var(--muted)" : x.sc >= q.m ? "var(--good)" : x.sc ? "var(--amber)" : "var(--bad)"}">${x.skip ? "skipped" : x.sc + "/" + q.m}</span></div>`).join("")}</div>
+    <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap"><button class="btn" data-act="x-start">Another set</button><button class="btn ghost" data-act="x-quit">Change settings</button></div>
+  </div></div>`;
 }
 function initPads() {
   document.querySelectorAll(".pad").forEach(pad => {
@@ -865,6 +1070,7 @@ function examSave(k, el) {
   const sc = exScore(q, k); S.exam = S.exam || {};
   const old = S.exam[k], firstToday = !old || old.d !== today();
   S.exam[k] = { b: Math.max(sc, old ? old.b : 0), l: sc, d: today() };
+  S.exDone = S.exDone || {}; S.exDone[k] = S.exDone[k] || today();
   if (firstToday) { const r = el.getBoundingClientRect(); addXP(Math.min(25, 3 + sc), { x: r.left, y: r.top }); }
   if (sc >= q.m) confetti();
   toast("exam", sc >= q.m ? "Full marks!" : "Mark saved", `${sc}/${q.m}${firstToday ? " · +" + Math.min(25, 3 + sc) + " XP" : ""}`);
@@ -879,7 +1085,49 @@ function examRandom() {
   const c = document.getElementById("xq-" + n); if (c) c.scrollIntoView({ block: "center", behavior: "smooth" });
 }
 
+/* ================= PROFILE / STATS ================= */
+function profileView() {
+  const L = levelOf(S.xp), from = lvlXP(L), to = lvlXP(L + 1), st = S.stats;
+  const dayKeys = Object.keys(S.days).sort(), active = dayKeys.filter(k => (S.days[k].xp || 0) > 0).length;
+  const subjSecAll = {}; dayKeys.forEach(k => Object.entries(S.days[k].subjSec || {}).forEach(([sid, v]) => subjSecAll[sid] = (subjSecAll[sid] || 0) + v));
+  const maxSubj = Math.max(1, ...Object.values(subjSecAll));
+  const E = S.exam || {}, exN = Object.keys(E).length, exGot = Object.values(E).reduce((a, x) => a + (x.b || 0), 0);
+  const exTot = Object.keys(E).reduce((a, k) => { const q = EXQ.find(x => exKey(x) === k); return a + (q ? q.m : 0); }, 0);
+  const got = Object.keys(S.badges).length;
+  // last 8 weeks of minutes (Mon–Sun)
+  const weeks = []; const now = new Date(), dow = (now.getDay() + 6) % 7;
+  for (let w = 7; w >= 0; w--) { let sec = 0; const start = new Date(); start.setDate(now.getDate() - dow - 7 * w);
+    for (let i = 0; i < 7; i++) { const d = new Date(start); d.setDate(start.getDate() + i); sec += (S.days[dkey(d)] || {}).sec || 0; }
+    weeks.push({ label: start.toLocaleDateString("en-GB", { day: "numeric", month: "short" }), min: Math.round(sec / 60) }); }
+  const wmax = Math.max(30, ...weeks.map(w => w.min));
+  const tile = (v, l, c) => `<div class="card stat pf-tile"${c ? ` style="--c:${c}"` : ""}><div class="label">${l}</div><div class="v num">${v}</div></div>`;
+  return topbar("Your stats", "Everything you've done so far.") + `
+  <section class="card pf-hero">
+    <div class="avatar big">${esc((S.name || "J")[0].toUpperCase())}</div>
+    <div class="pf-id"><h2>${esc(S.name)}</h2><div class="muted">Level ${L} · ${rankOf(L)} · ${S.xp.toLocaleString("en-GB")} XP</div>
+      <div class="bar" style="margin-top:10px"><i style="width:${(S.xp - from) / (to - from) * 100}%"></i></div>
+      <div class="muted" style="font-size:12.5px;margin-top:6px">${(to - S.xp).toLocaleString("en-GB")} XP to level ${L + 1}</div></div>
+    <div class="pf-acc">${ACC.server ? (ACC.user ? `<span class="sync-pill on">${svg("check")} Synced as <b>${esc(ACC.user)}</b></span><button class="mini-link" data-act="sign-out">Sign out</button>`
+      : `<span class="sync-pill">Only saved on this device</span><button class="btn small" data-act="sign-in">${svg("user")} Sign in to sync</button>`)
+      : `<span class="sync-pill${synced ? " on" : ""}">${synced ? "Saved to your account" : "Saved on this device"}</span>`}</div>
+  </section>
+  <section class="grid pf-tiles">
+    ${tile(fmtMin(S.sec), "Time revised")}${tile(streak() + "<small> days</small>", "Current streak")}${tile(Math.max(st.bestStreak, streak()) + "<small> days</small>", "Best streak")}${tile(active, "Days revised")}
+    ${tile(st.answered.toLocaleString("en-GB"), "Questions answered")}${tile(st.answered ? Math.round(st.correct / st.answered * 100) + "%" : "–", "Quiz accuracy")}${tile(st.quizzes, "Quizzes done")}${tile(st.perfect, "Perfect quizzes")}
+    ${tile(st.cards.toLocaleString("en-GB"), "Flashcards flipped")}${tile(st.focus, "Focus sessions")}${tile(exN, "Exam Qs marked")}${tile(exTot ? Math.round(exGot / exTot * 100) + "%" : "–", "Exam marks banked")}
+    ${tile((S.papers || []).length, "Past papers done")}${tile(st.bestCombo, "Best combo")}${tile(got + "<small> / " + BADGES.length + "</small>", "Badges")}${tile(Object.keys(S.exDone || {}).length, "Exam Qs ticked off")}
+  </section>
+  <section class="grid" style="grid-template-columns:repeat(auto-fit,minmax(320px,1fr));margin-top:16px">
+    <div class="card"><div class="card-head"><h2>Last 8 weeks</h2><span class="muted" style="font-size:13px;font-weight:600">minutes revised</span></div>
+      <div class="pf-weeks">${weeks.map((w, i) => `<div class="pf-wk${i === 7 ? " now" : ""}" title="${w.min} min, week of ${w.label}"><span class="num">${w.min || ""}</span><i style="height:${Math.max(3, w.min / wmax * 100)}%"></i><small>${w.label}</small></div>`).join("")}</div></div>
+    <div class="card"><div class="card-head"><h2>By subject</h2><span class="muted" style="font-size:13px;font-weight:600">time · quiz accuracy</span></div>
+      ${SUBJECTS.map(x => { const sec = subjSecAll[x.id] || 0, acc = accuracy(x.id); return `<div class="pf-sub" style="--c:${x.color}"><span class="wk-name">${x.short}</span><span class="wk-bar"><i style="width:${sec / maxSubj * 100}%"></i></span><span class="num pf-sub-v">${fmtMin(sec)}</span><span class="num pf-sub-a">${acc == null ? "–" : acc + "%"}</span></div>`; }).join("")}
+      <p class="muted" style="font-size:12px;margin:8px 0 0">Subject time counts from when weekly targets were added.</p></div>
+  </section>`;
+}
+
 /* ================= CALENDAR ================= */
+const revBtns = e => { const p = evPaper(e); return `<span class="rev-btns"><button class="plink" data-act="rev-quiz" data-s="${e.s}" data-p="${p}" title="Quiz on ${esc(SUBJ[e.s].name)}${p ? " " + p : ""} topics">${svg("quiz")}Quiz</button><button class="plink go" data-act="rev-exam" data-s="${e.s}" data-p="${p}" title="Exam questions for ${esc(SUBJ[e.s].name)}${p ? " " + p : ""}">${svg("exam")}Exam Qs</button></span>`; };
 const allEvents = () => [...(window.EVENTS || []), ...(S.events || []).map(e => ({ ...e, k: "own", mine: true }))];
 const daysTo = d => Math.round((new Date(d + "T00:00:00") - new Date(today() + "T00:00:00")) / 86400000);
 const upcoming = () => allEvents().map(e => ({ ...e, days: daysTo(e.d) })).filter(e => e.days >= 0).sort((a, b) => a.d.localeCompare(b.d) || (a.time || "").localeCompare(b.time || ""));
@@ -898,7 +1146,7 @@ function calView() {
     const k = cal.y + "-" + pad(cal.m + 1) + "-" + pad(d), list = byDay[k] || [], rec = S.days[k], wd = (start + d - 1) % 7;
     const hit = rec && rec.xp >= STREAK_XP;
     cells.push(`<button class="cal-cell${k === today() ? " today" : ""}${k === cal.sel ? " sel" : ""}${wd > 4 ? " wkend" : ""}${list.some(e => e.k === "gcse") ? " has-gcse" : list.some(e => e.k === "mock") ? " has-mock" : ""}" data-act="cal-day" data-d="${k}" aria-label="${d} ${monthName}${list.length ? ", " + list.length + " events" : ""}">
-      <span class="cal-n">${d}${hit ? `<i class="cal-hit" title="Revised: ${rec.xp} XP">${svg("flame")}</i>` : ""}</span>
+      <span class="cal-n">${d}${hit ? `<i class="cal-hit" title="Revised: ${rec.xp} XP">${svg("flame")}</i>` : ""}${rec && rec.sec >= 60 ? `<em class="cal-min" title="${fmtMin(rec.sec)} revised">${fmtMin(rec.sec).replace(" min", "m")}</em>` : ""}</span>
       ${list.slice(0, 3).map(e => `<span class="cal-ev" style="--c:${e.s && SUBJ[e.s] ? SUBJ[e.s].color : KIND[e.k][1]}">${e.time ? `<b>${e.time}</b> ` : ""}${esc(shortEv(e.t))}</span>`).join("")}
       ${list.length > 3 ? `<span class="cal-more">+${list.length - 3} more</span>` : ""}
     </button>`);
@@ -907,14 +1155,14 @@ function calView() {
   const selRec = S.days[cal.sel], selDays = daysTo(cal.sel);
   const up = upcoming().slice(0, 8);
   const label = d => new Date(d + "T00:00:00").toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" });
-  const evRow = e => `<div class="cal-item" style="--c:${e.s && SUBJ[e.s] ? SUBJ[e.s].color : KIND[e.k][1]}"><i></i><div><b>${esc(e.t)}</b><span>${[e.time, e.len, KIND[e.k][0]].filter(Boolean).join(" · ")}</span></div>${e.mine ? `<button class="plink del" data-act="cal-del" data-id="${esc(e.id)}" aria-label="Delete ${esc(e.t)}">${svg("trash")}</button>` : ""}</div>`;
+  const evRow = e => `<div class="cal-item" style="--c:${e.s && SUBJ[e.s] ? SUBJ[e.s].color : KIND[e.k][1]}"><i></i><div><b>${esc(e.t)}</b><span>${[e.time, e.len, KIND[e.k][0]].filter(Boolean).join(" · ")}</span></div>${e.s && !e.mine ? revBtns(e) : ""}${e.mine ? `<button class="plink del" data-act="cal-del" data-id="${esc(e.id)}" aria-label="Delete ${esc(e.t)}">${svg("trash")}</button>` : ""}</div>`;
   return topbar("Calendar", "Your mocks, GCSEs and revision days in one place.") + `
   <div class="cal-wrap">
     <div class="card cal-card">
       <div class="cal-head"><button class="ann-btn cal-nav" data-act="cal-mv" data-n="-1" aria-label="Previous month">‹</button><h2>${monthName}</h2><button class="ann-btn cal-nav" data-act="cal-mv" data-n="1" aria-label="Next month">›</button>
         <div class="cal-jumps"><button class="mchip" data-act="cal-jump" data-d="${today()}">Today</button><button class="mchip" data-act="cal-jump" data-d="2027-01-04">Mocks</button><button class="mchip" data-act="cal-jump" data-d="2027-05-11">GCSEs</button></div></div>
       <div class="cal-grid">${["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map(d => `<div class="cal-dow">${d}</div>`).join("")}${cells.join("")}</div>
-      <div class="cal-legend"><span><i style="background:#ff9f43"></i>Mock</span><span><i style="background:#ff5d73"></i>GCSE</span><span class="cal-hit">${svg("flame")}</span><span>Streak day</span><span class="muted">Colours on events match the subject</span></div>
+      <div class="cal-legend"><span><i style="background:#ff9f43"></i>Mock</span><span><i style="background:#ff5d73"></i>GCSE</span><span class="cal-hit">${svg("flame")}</span><span>Streak day</span><span><em class="cal-min">25m</em> time revised</span><span class="muted">Colours on events match the subject</span></div>
     </div>
     <div class="cal-side">
       <div class="card">
@@ -1046,25 +1294,38 @@ document.addEventListener("click", e => {
     case "del-prog": confirmBox("Delete this paper?", "Removes \"" + el.dataset.t + "\" and its annotations from this device. Download it first if you want to keep your work.", "Delete", () => { window.Annotator.remove(el.dataset.id).then(refreshInProg); }); break;
     case "p-check": if (S.donePapers && S.donePapers[el.dataset.k]) confirmBox("Untick this paper?", "It'll come off your finished list. The XP stays.", "Untick", () => paperUndone(el.dataset.k)); else paperDone(el.dataset.t, el.dataset.k); break;
     case "v-sid": vidSid = el.dataset.s; render(); break;
-    case "x-sid": exq.sid = el.dataset.s; exq.topic = ""; exq.open = null; render(); break;
-    case "topic-exam": exq = { ...exq, sid: el.dataset.s, topic: el.dataset.t, open: null }; go("exam"); break;
+    case "x-sid": exq.sid = el.dataset.s; exq.paper = ""; exq.topic = ""; exq.marks = ""; exq.open = null; exq.run = null; render(); break;
+    case "topic-exam": exq = { ...exq, sid: el.dataset.s, paper: "", topic: el.dataset.t, marks: "", open: null, run: null, browse: false }; go("exam"); break;
+    case "sign-in": openAuth(S.updated ? "register" : "login"); break;
+    case "sign-out": confirmBox("Sign out?", "Your progress stays saved on the server and on this device.", "Sign out", async () => { try { await apiFetch("POST", "/api/logout"); } catch (e) {} signOutLocal(); render(); }); break;
     case "cal-mv": { const d = new Date(cal.y, cal.m + +el.dataset.n, 1); cal.y = d.getFullYear(); cal.m = d.getMonth(); render(); break; }
     case "cal-day": cal.sel = el.dataset.d; render(); break;
     case "cal-jump": { const d = new Date(el.dataset.d + "T00:00:00"); cal.y = d.getFullYear(); cal.m = d.getMonth(); cal.sel = el.dataset.d; render(); break; }
     case "cal-del": S.events = (S.events || []).filter(e => e.id !== el.dataset.id); save(); render(); break;
     case "x-marks": exq.marks = el.dataset.m; exq.open = null; render(); break;
+    case "x-n": exq.n = +el.dataset.n; render(); break;
+    case "x-start": examStart(); break;
+    case "x-quit": if (exq.run && !exq.run.done && exq.run.i > 0) confirmBox("End this set?", "Marks you've saved stay saved.", "End set", () => { exq.run = null; render(); }); else { exq.run = null; render(); } break;
+    case "x-next": examNext(true); break;
+    case "x-skipq": examNext(false); break;
+    case "x-done": toggleDone(el.dataset.k); render(); break;
+    case "x-browse": exq.browse = !exq.browse; exq.open = null; render(); window.scrollTo(0, 0); break;
     case "x-open": exq.reveal = {}; exq.open = exq.open === el.dataset.k ? null : el.dataset.k; render(); { const c = document.getElementById("xq-" + el.dataset.n); if (c) c.scrollIntoView({ block: "nearest" }); } break;
     case "x-reveal": exq.reveal[el.dataset.k] = true; render(); break;
     case "x-hide": exq.reveal[el.dataset.k] = false; render(); break;
     case "x-tick": { const k = el.dataset.k, i = +el.dataset.i, t = (exq.ticks[k] = exq.ticks[k] || {}); t[i] = !t[i]; render(); break; }
     case "x-save": examSave(el.dataset.k, el); break;
     case "x-random": examRandom(); break;
-    case "subj-topics": topicSid = el.dataset.s; go("topics"); break;
-    case "qs-sid": qsetup.sid = el.dataset.s; if (qsetup.sid === "all" && qsetup.mode === "topic") qsetup.mode = "mixed"; qsetup.topic = ""; render(); break;
+    case "subj-topics": topicSid = el.dataset.s; topicPaper = el.dataset.p || ""; go("topics"); break;
+    case "qs-sid": qsetup.sid = el.dataset.s; qsetup.paper = ""; if (qsetup.sid === "all" && qsetup.mode === "topic") qsetup.mode = "mixed"; qsetup.topic = ""; render(); break;
     case "qs-mode": if (el.dataset.m === "topic" && qsetup.sid === "all") break; qsetup.mode = el.dataset.m;
       if (qsetup.mode === "topic" && !qsetup.topic) { const t = SUBJ[qsetup.sid].topics.find(t => topicHasQs(qsetup.sid, t[1])); qsetup.topic = t ? t[1] : ""; } render(); break;
     case "qs-n": qsetup.n = +el.dataset.n; render(); break;
-    case "start-quiz": startQuiz(qsetup.sid, qsetup.mode, qsetup.topic, qsetup.n); break;
+    case "start-quiz": startQuiz(qsetup.sid, qsetup.mode, qsetup.topic, qsetup.n, qsetup.paper); break;
+    case "qs-paper": qsetup.paper = el.dataset.p; if (qsetup.mode === "topic") { const t = SUBJ[qsetup.sid].topics.find(t => inPaper(qsetup.sid, t[1], qsetup.paper) && topicHasQs(qsetup.sid, t[1])); qsetup.topic = t ? t[1] : ""; } render(); break;
+    case "x-paper": exq.paper = el.dataset.p; exq.topic = ""; exq.marks = ""; render(); break;
+    case "rev-quiz": qsetup = { ...qsetup, sid: el.dataset.s, paper: el.dataset.p || "", mode: "mixed", topic: "", n: 10 }; startQuiz(el.dataset.s, "mixed", "", 10, el.dataset.p || ""); break;
+    case "rev-exam": exq = { ...exq, sid: el.dataset.s, paper: el.dataset.p || "", topic: "", marks: "", run: null, browse: false, open: null }; go("exam"); break;
     case "answer": answer(+el.dataset.i, { currentTarget: el }); break;
     case "next-q": nextQ(); break;
     case "quit-quiz": confirmBox("Quit this quiz?", "XP you've already earned stays.", "Quit", () => { quiz = null; render(); }); break;
@@ -1074,7 +1335,10 @@ document.addEventListener("click", e => {
     case "flip": if (fc) { fc.flipped = !fc.flipped; render(); } break;
     case "card-again": cardAnswer(false, { currentTarget: el }); break;
     case "card-got": cardAnswer(true, { currentTarget: el }); break;
-    case "t-sid": topicSid = el.dataset.s; render(); break;
+    case "t-sid": if (topicSid !== el.dataset.s) topicPaper = ""; topicSid = el.dataset.s; render(); break;
+    case "t-paper": topicPaper = el.dataset.p; render(); break;
+    case "fc-sid": fcF = { sid: el.dataset.s, paper: "" }; render(); break;
+    case "fc-paper": fcF.paper = el.dataset.p; render(); break;
     case "rag": { const r = (S.rag[topicSid] = S.rag[topicSid] || {}); const i = el.dataset.i; r[i] = r[i] === el.dataset.v ? undefined : el.dataset.v; if (!r[i]) delete r[i]; save(); checkBadges(); render(); break; }
     case "topic-quiz": qsetup = { sid: topicSid, mode: "topic", topic: el.dataset.t, n: 10 }; startQuiz(topicSid, "topic", el.dataset.t, 10); break;
     case "f-len": focus.len = focus.left = +el.dataset.n * 60; focus.tick = 0; render(); break;
@@ -1091,6 +1355,7 @@ document.addEventListener("submit", e => {
 document.addEventListener("input", e => { if (e.target.dataset && e.target.dataset.draft) exq.draft[e.target.dataset.draft] = e.target.value; });
 document.addEventListener("change", e => {
   if (e.target.id === "qs-topic") { qsetup.topic = e.target.value; }
+  if (e.target.id === "x-skip") { exq.skipDone = e.target.checked; render(); }
   if (e.target.id === "x-topic") { exq.topic = e.target.value; exq.open = null; render(); }
   if (e.target.id === "set-week") { S.weekMin = +e.target.value; const d = dayRec(today()); if (d.plan && !d.tasks.focus) d.plan.time = timeTask(); save(); render(); }
   if (e.target.id === "set-goal") { S.goal = +e.target.value; save(); updateStatus(); }
@@ -1108,7 +1373,7 @@ document.addEventListener("keydown", e => {
     else if (fc.flipped && e.key === "2") cardAnswer(true, { currentTarget: $("[data-act=card-got]") });
   }
 });
-addEventListener("hashchange", () => { const v = location.hash.slice(1); if (NAV.some(n => n[0] === v) && v !== view) { view = v; render(); } });
+addEventListener("hashchange", () => { const v = location.hash.slice(1); if ((NAV.some(n => n[0] === v) || v === "profile") && v !== view) { view = v; animNext = true; render(); } });
 addEventListener("visibilitychange", () => { if (document.hidden) save(); });
 
 /* time on task: counts while you're in a quiz or flashcard session and active in the last 90 s */
@@ -1117,12 +1382,13 @@ setInterval(() => {
   if (document.hidden || Date.now() - lastAct >= 90000) return;
   if (view === "quiz" && quiz && !quiz.done) addSec(1, (quiz.qs[quiz.i] || {}).s);
   else if (view === "cards" && fc && !fc.done) addSec(1, fc.deck.s);
+  else if (view === "exam" && exq.run && !exq.run.done) addSec(1, exq.run.list[exq.run.i].s);
   else if (view === "exam" && exq.open) addSec(1, exq.sid);
 }, 1000);
 
 /* boot */
 const startV = location.hash.slice(1);
-if (NAV.some(n => n[0] === startV)) view = startV;
+if (NAV.some(n => n[0] === startV) || startV === "profile") view = startV;
 render();
 connect();
 })();

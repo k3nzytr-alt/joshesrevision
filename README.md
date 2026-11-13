@@ -1,40 +1,77 @@
-# Revision HQ
+# Revise
 
-A static site: plain HTML, CSS and JavaScript. No build step and no server code.
+A GCSE revision site with accounts, so your progress (XP, streak, weekly minutes, exam marks, calendar events and so on) syncs between your phone and laptop.
 
-## Deploy
+- `server.js` is a tiny Node server with no dependencies. It serves the site and stores accounts and progress.
+- `public/` holds the site itself.
 
-Pick any one of these.
+You need **Node 18 or newer**.
 
-**Netlify (easiest).** Go to https://app.netlify.com/drop and drag the `revision-hq` folder onto the page.
+## Run it on your own computer
 
-**Vercel.** Run `npx vercel` inside this folder, or import it as a project. Framework: "Other". There's no build command, and the output directory is `.` (the folder itself).
+```
+node server.js
+```
 
-**GitHub Pages.** Push this folder to a repo, then go to Settings → Pages → Deploy from branch → `main` / root.
+Then open http://localhost:3000, create an account, and sign in with the same details on your phone. To use it from your phone this way, your phone must be on the same Wi-Fi and you open `http://YOUR-PC-IP:3000`.
 
-**Cloudflare Pages.** Upload the folder directly. There's no build command.
+## Put it online
 
-`index.html` must sit at the root of whatever you deploy.
+Pick one of these.
 
-## Things to know
+### Option A: Render + Upstash (free, recommended)
 
-- **Progress:** XP, streak, weekly subject minutes, ratings, exam marks and calendar events save in the browser's localStorage, one device and browser at a time. Clearing site data wipes them. (The claude.ai version also synced to your account; that only works inside Claude.)
-- **Papers in progress:** the PDFs and annotations you're working on are saved in IndexedDB on that device.
-- **CDN dependencies:** the PDF annotator loads pdf.js 3.11.174 and jsPDF 2.5.1 from cdnjs. Fonts come from Google Fonts, so the site needs internet access.
-- **Annotated PDFs:** these download as a normal browser download.
+Render's free plan has no permanent disk, so progress is stored in a free Upstash Redis database instead.
 
-## Files
+1. Go to **https://upstash.com**, sign up, and click **Create database** (Redis, any region near the UK).
+2. On the database page, open the **REST API** section. Copy `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`.
+3. Put this folder in a GitHub repo.
+4. Go to **https://render.com**, then **New → Web Service**, and connect the repo.
+   - Runtime: **Node**
+   - Build command: *(leave blank)*
+   - Start command: `node server.js`
+   - Instance type: **Free**
+5. Under **Environment**, add the two variables from step 2. Then click **Deploy**.
 
-| File | What it holds |
+On the free plan the site sleeps after about 15 minutes with nobody using it. The first visit after that takes around 30 seconds to wake it up. Your data is safe in Upstash either way.
+
+### Option B: Railway (simple, uses a volume)
+
+1. Go to **https://railway.app**, then **New Project → Deploy from GitHub repo**.
+2. Add a **Volume** to the service, mounted at `/data`.
+3. Add the variable `DATA_DIR=/data`.
+4. Railway sets `PORT` for you, and the start command is `node server.js` (from `package.json`).
+
+### Option C: Any VPS, Raspberry Pi or Docker host
+
+```
+docker build -t revision-hq .
+docker run -d -p 3000:3000 -v revision-data:/data revision-hq
+```
+
+Or run `node server.js` with `pm2` or `systemd`. Back up the `data/` folder now and then.
+
+## Settings (environment variables)
+
+| Variable | What it does |
 |---|---|
-| `index.html` | Page shell |
-| `style.css` | All styling |
-| `app.js` | The app: views, XP, streaks, quizzes, calendar and so on |
-| `annotate.js` | The PDF annotator |
-| `data.js` | Subjects, topics, quiz questions, flashcards, past paper links, exam and mock dates |
-| `extra.js`, `geogq.js` | Extra quiz questions |
-| `examq1.js`, `examq2.js`, `examq3.js`, `examq_geog.js` | Exam-style questions with mark schemes |
-| `videos.js` | Video links per topic |
-| `split.js` | Moves Literature content out of English Language (must load after the data files) |
+| `PORT` | Port to listen on (default 3000). |
+| `DATA_DIR` | Where accounts and progress are saved when Upstash isn't used (default `./data`). |
+| `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` | Store data in Upstash instead of files. |
+| `ALLOW_SIGNUPS` | Set to `false` once you've made your account, so nobody else can sign up. |
 
-To change exam or mock dates, edit `window.EVENTS` in `data.js`.
+## How syncing works
+
+- The first time you open the site, it asks you to sign in or create an account.
+  - **Creating an account** uploads whatever progress is already on that device.
+  - **Signing in** on another device loads your saved progress.
+- After that, every change saves to the server a couple of seconds later.
+- When you switch back to the tab, it pulls in anything newer from your other devices. If two devices save at the same time, the newest save wins.
+- Passwords are hashed with scrypt, and you're locked out for 15 minutes after 10 wrong attempts.
+- "Use on this device only" skips accounts. You can sign in later from your profile (tap your name, top left).
+
+**What doesn't sync:** PDFs you're annotating stay on the device you opened them on. They're too big to sync. Everything else syncs.
+
+## Updating the site
+
+Replace the files in `public/`, then redeploy. Your saved accounts and progress aren't touched.

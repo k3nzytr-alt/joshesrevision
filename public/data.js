@@ -1,4 +1,4 @@
-/* Revision HQ — content. In every question the first option is the correct one; the app shuffles them. */
+/* Revise — content. In every question the first option is the correct one; the app shuffles them. */
 window.SUBJECTS = [
   { id: "bio", name: "Biology", short: "Bio", color: "#3ddc97", board: "Edexcel Combined",
     topics: [
