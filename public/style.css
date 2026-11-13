@@ -831,3 +831,8 @@ button.me:hover > svg { transform: translateX(3px); }
 @media (max-width: 760px) { .cal-item .rev-btns { width: 100%; margin-left: 14px; } }
 .mchips.pfilter { display: inline-flex; width: auto; align-items: center; gap: 6px; padding: 5px; padding-left: 16px; border: 1px solid var(--line); border-radius: 999px; background: var(--panel); }
 .mchips.pfilter .mchip { margin: 0; }
+.sync-btn { all: unset; cursor: pointer; color: var(--amber); font: inherit; }
+.sync-btn:hover { text-decoration: underline; }
+.sync-dot.warn { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
+.auth-note { background: color-mix(in srgb, var(--amber) 14%, transparent); border: 1px solid color-mix(in srgb, var(--amber) 40%, transparent); color: var(--text); border-radius: 10px; padding: 10px 12px; font-size: 13.5px; margin: 0 0 10px; }
+.pf-warn { flex-basis: 100%; font-size: 13px; color: var(--amber); }

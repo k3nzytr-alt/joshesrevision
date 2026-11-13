@@ -116,15 +116,22 @@ async function flushRemote() {
   if (pendingWrite) { pendingWrite = false; flushRemote(); }
 }
 function setSync(on) { synced = on; const el = $("#sync"); if (el) el.innerHTML = syncHTML(); }
-const syncHTML = () => '<span class="sync-dot' + (synced ? " on" : "") + '"></span>' + (synced ? (ACC.user ? "Synced as " + esc(ACC.user) : "Saved to your account") : ACC.server ? "Not synced · sign in" : "Saved on this device");
+const syncHTML = () => {
+  const dot = '<span class="sync-dot' + (synced ? " on" : ACC.server || ACC.noServer ? " warn" : "") + '"></span>';
+  if (synced) return dot + (ACC.user ? "Synced as " + esc(ACC.user) : "Saved to your account");
+  if (ACC.server) return `<button class="sync-btn" data-act="sign-in">${dot}Not synced · tap to sign in</button>`;
+  if (ACC.noServer) return `<button class="sync-btn" data-act="sync-help">${dot}This device only · why?</button>`;
+  return dot + "Saved on this device";
+};
+const NOSERVER_MSG = "This page was opened from a host that's only serving the files, so there's no sync server behind it (no /api). Run it as a Node web service (start command: node server.js) instead of a static site, then sign in on both devices with the same account.";
 
 /* ---------- own-server accounts (when hosted with server.js) ---------- */
-const ACC = { server: false, signups: true, token: "", user: "" };
+const ACC = { server: false, noServer: false, signups: true, token: "", user: "" };
 try { ACC.token = localStorage.getItem("rhq-token") || ""; ACC.user = localStorage.getItem("rhq-user") || ""; } catch (e) {}
 async function apiFetch(method, path, body) {
   const r = await fetch(path, { method, headers: { "Content-Type": "application/json", ...(ACC.token ? { Authorization: "Bearer " + ACC.token } : {}) }, body: body ? JSON.stringify(body) : undefined });
   let j = {}; try { j = await r.json(); } catch (e) {}
-  if (r.status === 401 && ACC.token && path !== "/api/login") { signOutLocal(); }
+  if (r.status === 401 && ACC.token && path !== "/api/login") { signOutLocal(); openAuth("login", "You got signed out, usually because the server was reset. Sign in again (or create the account again if it says wrong password)."); }
   return { ok: r.ok, status: r.status, j };
 }
 const serverRemote = {
@@ -154,13 +161,13 @@ async function authSubmit(mode, username, password) {
   return null;
 }
 let authMode = "login";
-function openAuth(mode) {
-  authMode = mode || (ACC.signups ? "login" : "login");
+function openAuth(mode, note) {
+  authMode = mode || "login";
   let el = $("#auth"); if (!el) { el = document.createElement("div"); el.id = "auth"; el.className = "modal-bg auth-bg"; document.body.appendChild(el); }
   el.innerHTML = `<form class="modal auth" id="auth-form" autocomplete="on">
     <div class="auth-mark">${svg("star")}</div>
     <h2>${authMode === "register" ? "Create your account" : "Sign in to sync"}</h2>
-    <p class="muted">${authMode === "register" ? "Your progress on this device becomes your account. Then sign in on your phone with the same details." : "Pick up your streak, XP and progress on any device."}</p>
+    ${note ? `<p class="auth-note">${esc(note)}</p>` : ""}<p class="muted">${authMode === "register" ? "Your progress on this device becomes your account. Then sign in on your phone with the same details." : "Pick up your streak, XP and progress on any device."}</p>
     <label>Username<input id="au-user" name="username" autocomplete="username" required minlength="3" maxlength="24" value="${esc(ACC.user || "")}"></label>
     <label>Password<input id="au-pass" name="password" type="password" autocomplete="${authMode === "register" ? "new-password" : "current-password"}" required minlength="6"></label>
     <div class="auth-err" id="au-err" role="alert"></div>
@@ -187,10 +194,10 @@ async function connectServer() {
   try {
     const r = await fetch("/api/health", { cache: "no-store" }); if (!r.ok) return false;
     const j = await r.json(); if (!j || !j.ok) return false;
-    ACC.server = true; ACC.signups = j.signups !== false; setSync(false);
+    ACC.server = true; ACC.signups = j.signups !== false; ACC.persistent = j.persistent !== false; setSync(false);
   } catch (e) { return false; }
   if (ACC.token) { remote = serverRemote; if (!(await pullServer(false))) { if (!ACC.token) openAuth("login"); } }
-  else { let skip = false; try { skip = !!localStorage.getItem("rhq-noauth"); } catch (e) {} if (!skip) openAuth(S.updated ? "register" : "login"); }
+  else { let skip = false; try { skip = !!localStorage.getItem("rhq-noauth"); } catch (e) {} if (!skip) openAuth("login"); }
   // when you come back to the tab, grab anything another device saved
   addEventListener("visibilitychange", () => { if (!document.hidden && remote === serverRemote) pullServer(false); });
   addEventListener("focus", () => { if (remote === serverRemote) pullServer(false); });
@@ -200,7 +207,7 @@ async function connectServer() {
 async function connect(tries = 0) {
   if (tries === 0 && await connectServer()) return;
   const c = window.claude;
-  if (!c || typeof c.use !== "function") { if (tries < 6) setTimeout(() => connect(tries + 1), 1500); return; }
+  if (!c || typeof c.use !== "function") { if (tries < 6) setTimeout(() => connect(tries + 1), 1500); else if (/^https?:$/.test(location.protocol)) { ACC.noServer = true; setSync(false); if (view === "profile") render(); } return; }
   try {
     const [db, user] = await Promise.all([c.use("db"), c.use("user")]);
     if (!db || !user) return;
@@ -1107,8 +1114,9 @@ function profileView() {
     <div class="pf-id"><h2>${esc(S.name)}</h2><div class="muted">Level ${L} · ${rankOf(L)} · ${S.xp.toLocaleString("en-GB")} XP</div>
       <div class="bar" style="margin-top:10px"><i style="width:${(S.xp - from) / (to - from) * 100}%"></i></div>
       <div class="muted" style="font-size:12.5px;margin-top:6px">${(to - S.xp).toLocaleString("en-GB")} XP to level ${L + 1}</div></div>
-    <div class="pf-acc">${ACC.server ? (ACC.user ? `<span class="sync-pill on">${svg("check")} Synced as <b>${esc(ACC.user)}</b></span><button class="mini-link" data-act="sign-out">Sign out</button>`
+    <div class="pf-acc">${ACC.server ? (ACC.user ? `<span class="sync-pill on">${svg("check")} Synced as <b>${esc(ACC.user)}</b></span><button class="mini-link" data-act="sync-now">Sync now</button><button class="mini-link" data-act="sign-out">Sign out</button>${ACC.persistent ? "" : `<span class="pf-warn">Heads up: your server saves to temporary files, so accounts get wiped whenever the host restarts. Add Upstash (see README) to fix it.</span>`}`
       : `<span class="sync-pill">Only saved on this device</span><button class="btn small" data-act="sign-in">${svg("user")} Sign in to sync</button>`)
+      : ACC.noServer ? `<span class="sync-pill">Only saved on this device</span><span class="muted" style="font-size:13px;flex-basis:100%">${NOSERVER_MSG}</span>`
       : `<span class="sync-pill${synced ? " on" : ""}">${synced ? "Saved to your account" : "Saved on this device"}</span>`}</div>
   </section>
   <section class="grid pf-tiles">
@@ -1296,7 +1304,9 @@ document.addEventListener("click", e => {
     case "v-sid": vidSid = el.dataset.s; render(); break;
     case "x-sid": exq.sid = el.dataset.s; exq.paper = ""; exq.topic = ""; exq.marks = ""; exq.open = null; exq.run = null; render(); break;
     case "topic-exam": exq = { ...exq, sid: el.dataset.s, paper: "", topic: el.dataset.t, marks: "", open: null, run: null, browse: false }; go("exam"); break;
-    case "sign-in": openAuth(S.updated ? "register" : "login"); break;
+    case "sign-in": openAuth("login"); break;
+    case "sync-help": go("profile"); break;
+    case "sync-now": pullServer(false).then(ok => toast(ok ? "check" : "info", ok ? "Synced" : "Couldn't sync", ok ? "Up to date with your account." : "Server didn't respond.")); break;
     case "sign-out": confirmBox("Sign out?", "Your progress stays saved on the server and on this device.", "Sign out", async () => { try { await apiFetch("POST", "/api/logout"); } catch (e) {} signOutLocal(); render(); }); break;
     case "cal-mv": { const d = new Date(cal.y, cal.m + +el.dataset.n, 1); cal.y = d.getFullYear(); cal.m = d.getMonth(); render(); break; }
     case "cal-day": cal.sel = el.dataset.d; render(); break;

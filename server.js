@@ -90,7 +90,7 @@ function readJSON(req) {
 /* ---------------- API ---------------- */
 async function api(req, res, url) {
   const route = req.method + " " + url.pathname;
-  if (route === "GET /api/health") return send(res, 200, { ok: true, signups: ALLOW_SIGNUPS, storage: store.kind });
+  if (route === "GET /api/health") return send(res, 200, { ok: true, signups: ALLOW_SIGNUPS, storage: store.kind, persistent: store.kind === "upstash" || !!process.env.DATA_DIR });
 
   if (route === "POST /api/register") {
     if (!ALLOW_SIGNUPS) return send(res, 403, { error: "New accounts are switched off on this server." });
@@ -160,4 +160,4 @@ http.createServer(async (req, res) => {
     if (!res.headersSent) send(res, e.code === 413 ? 413 : e.code === 400 ? 400 : 500, { error: e.code === 413 ? "Too much data." : e.code === 400 ? "Bad request." : "Server error." });
     if (!e.code) console.error(e);
   }
-}).listen(PORT, () => console.log(`Revise on http://localhost:${PORT}  (storage: ${store.kind}${store.kind === "files" ? " in " + DATA_DIR : ""})`));
+}).listen(PORT, () => { if (store.kind === "files" && !process.env.DATA_DIR) console.warn("WARNING: saving to local files with no DATA_DIR set. On Render/Railway free tiers these get wiped on every restart, which logs everyone out. Set UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN (or a DATA_DIR on a persistent volume)."); console.log(`Revise on http://localhost:${PORT}  (storage: ${store.kind}${store.kind === "files" ? " in " + DATA_DIR : ""})`); });

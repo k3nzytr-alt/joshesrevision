@@ -75,3 +75,12 @@ Or run `node server.js` with `pm2` or `systemd`. Back up the `data/` folder now 
 ## Updating the site
 
 Replace the files in `public/`, then redeploy. Your saved accounts and progress aren't touched.
+
+## Sync not working? (phone and computer show different progress)
+
+Check the bottom-left of the sidebar on **both** devices:
+
+- **"Synced as yourname"** on both: it's working. Make sure it's the same username on each.
+- **"Not synced · tap to sign in"**: tap it and sign in with the same account you made on the other device. Don't make a second account.
+- **"This device only · why?"**: the host is serving the files without running `server.js`. On Render this means it was made as a **Static Site**. Delete it and make a **Web Service** with start command `node server.js`.
+- **It keeps signing you out, or your login stops working**: the server is saving to temporary files that get wiped when the host restarts. Add the two Upstash variables (Option A). The profile page shows a warning when this is the case.
